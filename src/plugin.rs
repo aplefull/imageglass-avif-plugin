@@ -186,11 +186,11 @@ unsafe extern "C" fn can_handle_signature(sig: *const u8, len: i32) -> i32 {
         }
 
         // ACTUALLY_SAFE: the host passes `len` readable bytes for the duration of the call
-        let header = libavif_sys::avifROData {
+        let header = crate::sys::avifROData {
             data: sig,
             size: len as usize,
         };
-        (unsafe { libavif_sys::avifPeekCompatibleFileType(&header) } != 0) as i32
+        (unsafe { crate::sys::avifPeekCompatibleFileType(&header) } != 0) as i32
     })
 }
 

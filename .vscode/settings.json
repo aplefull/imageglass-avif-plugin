@@ -1,0 +1,8 @@
+{
+    "rust-analyzer.cargo.extraEnv": {
+        "AVIF_PLUGIN_SKIP_NATIVE": "1"
+    },
+    "rust-analyzer.check.extraEnv": {
+        "AVIF_PLUGIN_SKIP_NATIVE": "1"
+    }
+}

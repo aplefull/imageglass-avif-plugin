@@ -1,5 +1,5 @@
 use crate::abi::*;
-use libavif_sys as sys;
+use crate::sys;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -130,7 +130,7 @@ impl AvifFile {
                 has_alpha: decoder.alphaPresent != 0,
                 frame_count: decoder.imageCount.max(1) as u32,
                 file_size: self._data.len() as u64,
-                color_space: match image.colorPrimaries as u32 {
+                color_space: match image.colorPrimaries as i32 {
                     sys::AVIF_COLOR_PRIMARIES_BT2020 => IG_COLOR_SPACE_REC2020,
                     sys::AVIF_COLOR_PRIMARIES_SMPTE432 => IG_COLOR_SPACE_DISPLAY_P3,
                     _ => IG_COLOR_SPACE_SRGB,
@@ -213,7 +213,7 @@ impl AvifFile {
             }
 
             let frame = to_bgra(&*(*decoder).image)?;
-            Ok(apply_transforms(frame, &*(*decoder).image))
+            apply_transforms(frame, &*(*decoder).image)
         }
     }
 }
@@ -231,11 +231,7 @@ fn to_bgra(image: &sys::avifImage) -> Result<Frame, i32> {
         return Err(IG_STATUS_OUT_OF_MEMORY);
     }
 
-    let mut pixels = Vec::new();
-    pixels
-        .try_reserve_exact(size)
-        .map_err(|_| IG_STATUS_OUT_OF_MEMORY)?;
-    pixels.resize(size, 0);
+    let mut pixels = alloc_pixels(size)?;
 
     // ACTUALLY_SAFE: rgb points at `pixels`, sized for width x height x 4
     unsafe {
@@ -265,6 +261,16 @@ fn to_bgra(image: &sys::avifImage) -> Result<Frame, i32> {
     })
 }
 
+/// A zeroed pixel buffer, or an error if memory runs out
+fn alloc_pixels(size: usize) -> Result<Vec<u8>, i32> {
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(size)
+        .map_err(|_| IG_STATUS_OUT_OF_MEMORY)?;
+    pixels.resize(size, 0);
+    Ok(pixels)
+}
+
 /// Returns true if the image has a rotation transform
 fn has_rotation(image: &sys::avifImage) -> bool {
     image.transformFlags & sys::AVIF_TRANSFORM_IROT as u32 != 0 && image.irot.angle % 4 != 0
@@ -276,68 +282,50 @@ fn has_mirror(image: &sys::avifImage) -> bool {
 }
 
 /// Applies the container's 'irot' then 'imir'
-fn apply_transforms(mut frame: Frame, image: &sys::avifImage) -> Frame {
-    if has_rotation(image) {
-        frame = rotate_ccw(&frame, image.irot.angle % 4);
-    }
-
-    if has_mirror(image) {
-        mirror(&mut frame, image.imir.axis);
-    }
-
-    frame
-}
-
-/// Rotates anti-clockwise by `quarter_turns * 90` degrees
-fn rotate_ccw(src: &Frame, quarter_turns: u8) -> Frame {
-    let (w, h) = (src.width as usize, src.height as usize);
-    let (dst_w, dst_h) = if quarter_turns % 2 == 1 {
-        (h, w)
+fn apply_transforms(frame: Frame, image: &sys::avifImage) -> Result<Frame, i32> {
+    let ccw = if has_rotation(image) {
+        image.irot.angle % 4
     } else {
-        (w, h)
+        0
     };
-    let mut pixels = vec![0u8; src.pixels.len()];
+    let mirror = has_mirror(image).then_some(image.imir.axis);
 
-    for dy in 0..dst_h {
-        for dx in 0..dst_w {
-            let (sx, sy) = match quarter_turns {
-                1 => (w - 1 - dy, dx),
-                2 => (w - 1 - dx, h - 1 - dy),
-                _ => (dy, h - 1 - dx),
-            };
-            let s = (sy * w + sx) * 4;
-            let d = (dy * dst_w + dx) * 4;
-            pixels[d..d + 4].copy_from_slice(&src.pixels[s..s + 4]);
-        }
+    let (flip, cw) = match mirror {
+        None => (false, (4 - ccw) % 4),
+        Some(0) => (true, ccw),
+        Some(_) => (true, (ccw + 2) % 4),
+    };
+
+    if !flip && cw == 0 {
+        return Ok(frame);
     }
 
-    Frame {
+    let (w, h) = (frame.width, frame.height);
+    let (dst_w, dst_h) = if cw % 2 == 1 { (h, w) } else { (w, h) };
+    let mut pixels = alloc_pixels(frame.pixels.len())?;
+
+    // ACTUALLY_SAFE: both buffers hold w x h BGRA pixels
+    let result = unsafe {
+        sys::ARGBRotate(
+            frame.pixels.as_ptr(),
+            w as i32 * 4,
+            pixels.as_mut_ptr(),
+            dst_w as i32 * 4,
+            w as i32,
+            if flip { -(h as i32) } else { h as i32 },
+            cw as i32 * 90,
+        )
+    };
+
+    if result != 0 {
+        return Err(IG_STATUS_INTERNAL);
+    }
+
+    Ok(Frame {
         pixels,
-        width: dst_w as u32,
-        height: dst_h as u32,
-    }
-}
-
-/// Mirrors the frame according to the 'imir' axis. Axis 0 exchanges top and bottom, axis 1 exchanges left and right
-fn mirror(frame: &mut Frame, axis: u8) {
-    let (w, h) = (frame.width as usize, frame.height as usize);
-    let row = w * 4;
-
-    if axis == 0 {
-        for y in 0..h / 2 {
-            let (top, bottom) = frame.pixels.split_at_mut((h - 1 - y) * row);
-            top[y * row..(y + 1) * row].swap_with_slice(&mut bottom[..row]);
-        }
-    } else {
-        for line in frame.pixels.chunks_exact_mut(row) {
-            for x in 0..w / 2 {
-                let (a, b) = (x * 4, (w - 1 - x) * 4);
-                for c in 0..4 {
-                    line.swap(a + c, b + c);
-                }
-            }
-        }
-    }
+        width: dst_w,
+        height: dst_h,
+    })
 }
 
 struct CacheEntry {
