@@ -1,0 +1,18 @@
+[package]
+name = "avif-imageglass-plugin"
+version = "1.0.0"
+edition = "2024"
+description = "AVIF codec plugin for ImageGlass, powered by libavif and dav1d"
+license = "MIT"
+publish = false
+
+[lib]
+name = "AvifCodec"
+crate-type = ["cdylib"]
+
+[dependencies]
+libavif-sys = { version = "0.17", default-features = false, features = ["codec-dav1d"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
