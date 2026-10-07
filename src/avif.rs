@@ -63,7 +63,12 @@ impl Drop for AvifFile {
 
 impl AvifFile {
     fn open(path: &str) -> Result<Self, i32> {
-        let data = std::fs::read(path).map_err(|_| IG_STATUS_IO_ERROR)?;
+        let mut data = std::fs::read(path).map_err(|_| IG_STATUS_IO_ERROR)?;
+
+        // AD-HOC: repair duplicate ipma boxes
+        if crate::bmff::split_duplicate_ipma(&mut data) {
+            crate::host::log(LOG_WARN, &format!("AVIF: '{path}' has duplicate ipma boxes, repaired in memory"));
+        }
 
         // ACTUALLY_SAFE: plain libavif calls, the decoder only reads `data`, which the struct keeps alive
         unsafe {
@@ -232,6 +237,26 @@ fn to_bgra(image: &sys::avifImage) -> Result<Frame, i32> {
     }
 
     let mut pixels = alloc_pixels(size)?;
+
+    // AD-HOC: libavif refuses the constant luminance matrices, their non-constant twins are close enough to substitute
+    let substitute = match image.matrixCoefficients as i32 {
+        sys::AVIF_MATRIX_COEFFICIENTS_BT2020_CL => Some(sys::AVIF_MATRIX_COEFFICIENTS_BT2020_NCL),
+        sys::AVIF_MATRIX_COEFFICIENTS_CHROMA_DERIVED_CL => {
+            Some(sys::AVIF_MATRIX_COEFFICIENTS_CHROMA_DERIVED_NCL)
+        }
+        _ => None,
+    };
+    let patched;
+    let image = match substitute {
+        Some(matrix) => {
+            patched = sys::avifImage {
+                matrixCoefficients: matrix as _,
+                ..*image
+            };
+            &patched
+        }
+        None => image,
+    };
 
     // ACTUALLY_SAFE: rgb points at `pixels`, sized for width x height x 4
     unsafe {

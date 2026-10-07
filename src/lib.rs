@@ -3,6 +3,7 @@
 
 mod abi;
 mod avif;
+mod bmff;
 mod host;
 mod plugin;
 mod sys;
