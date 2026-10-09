@@ -93,12 +93,12 @@ fn build_codec_api() -> *mut IGCodecApi {
         get_animation_info: Some(get_animation_info),
         free_animation_info: Some(free_animation_info),
         decode_animation_frame: Some(decode_animation_frame),
+        decode_static_raster_scaled: Some(decode_static_raster_scaled),
 
         encode_static_raster: None,
         begin_encode_multi_frame: None,
         encode_frame: None,
         end_encode_multi_frame: None,
-        decode_static_raster_scaled: None,
     };
 
     Box::into_raw(Box::new(api))
@@ -245,9 +245,9 @@ fn decode_into(
     name: &str,
     path: IGStringRef,
     frame_index: i32,
-    animating: bool,
     out: *mut IGPixelBuffer,
     cancel: *mut c_void,
+    decode: impl FnOnce(&str, u32) -> Result<avif::Frame, i32>,
 ) -> i32 {
     guard(name, || {
         if out.is_null() || frame_index < 0 {
@@ -261,10 +261,7 @@ fn decode_into(
         // ACTUALLY_SAFE: the host passes a valid path slice and output struct for the call
         let (path, out) = unsafe { (path.to_string_lossy(), &mut *out) };
 
-        into_status(
-            avif::decode(&path, frame_index as u32, animating)
-                .map(|frame| avif::hand_over(frame, out)),
-        )
+        into_status(decode(&path, frame_index as u32).map(|frame| avif::hand_over(frame, out)))
     })
 }
 
@@ -274,7 +271,37 @@ unsafe extern "C" fn decode_static_raster(
     out: *mut IGPixelBuffer,
     cancel: *mut c_void,
 ) -> i32 {
-    decode_into("DecodeStaticRaster", path, frame, false, out, cancel)
+    decode_into(
+        "DecodeStaticRaster",
+        path,
+        frame,
+        out,
+        cancel,
+        |path, index| avif::decode(path, index, false),
+    )
+}
+
+unsafe extern "C" fn decode_static_raster_scaled(
+    path: IGStringRef,
+    frame: i32,
+    max_width: i32,
+    max_height: i32,
+    out: *mut IGPixelBuffer,
+    cancel: *mut c_void,
+) -> i32 {
+    decode_into(
+        "DecodeStaticRasterScaled",
+        path,
+        frame,
+        out,
+        cancel,
+        |path, index| {
+            if max_width <= 0 || max_height <= 0 {
+                return Err(IG_STATUS_INVALID_ARG);
+            }
+            avif::decode_scaled(path, index, max_width as u32, max_height as u32)
+        },
+    )
 }
 
 unsafe extern "C" fn decode_animation_frame(
@@ -283,7 +310,14 @@ unsafe extern "C" fn decode_animation_frame(
     out: *mut IGPixelBuffer,
     cancel: *mut c_void,
 ) -> i32 {
-    decode_into("DecodeAnimationFrame", path, frame, true, out, cancel)
+    decode_into(
+        "DecodeAnimationFrame",
+        path,
+        frame,
+        out,
+        cancel,
+        |path, index| avif::decode(path, index, true),
+    )
 }
 
 unsafe extern "C" fn free_pixel_buffer(buf: *mut IGPixelBuffer) {

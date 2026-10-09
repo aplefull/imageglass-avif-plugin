@@ -171,7 +171,10 @@ impl AvifFile {
 
         // AD-HOC: repair duplicate ipma boxes
         if crate::bmff::split_duplicate_ipma(&mut data) {
-            crate::host::log(LOG_WARN, &format!("AVIF: '{path}' has duplicate ipma boxes, repaired in memory"));
+            crate::host::log(
+                LOG_WARN,
+                &format!("AVIF: '{path}' has duplicate ipma boxes, repaired in memory"),
+            );
         }
 
         // ACTUALLY_SAFE: plain libavif calls, the decoder only reads `data`, which the struct keeps alive
@@ -558,6 +561,120 @@ fn apply_transforms(frame: Frame, image: &sys::avifImage) -> Result<Frame, i32> 
     })
 }
 
+/// The largest size inside `max_width` x `max_height` with the aspect ratio of `width` x `height`
+fn fit_box(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    let scale = (max_width as f64 / width as f64).min(max_height as f64 / height as f64);
+    if scale >= 1.0 {
+        return (width, height);
+    }
+
+    let fit = |side: u32| ((side as f64 * scale).round() as u32).max(1);
+    (fit(width), fit(height))
+}
+
+/// Shrinks `frame` to fit the box
+fn scale_to_fit(
+    mut frame: Frame,
+    has_alpha: bool,
+    max_width: u32,
+    max_height: u32,
+) -> Result<Frame, i32> {
+    let (width, height) = fit_box(frame.width, frame.height, max_width, max_height);
+    if (width, height) == (frame.width, frame.height) {
+        return Ok(frame);
+    }
+
+    let (src_w, src_h) = (frame.width as i32, frame.height as i32);
+    let (dst_w, dst_h) = (width as i32, height as i32);
+    let src_plane = frame.width as usize * frame.height as usize;
+    let dst_plane = width as usize * height as usize;
+    let channels = if has_alpha { 4 } else { 3 };
+
+    let mut src_planes = alloc_pixels(src_plane * channels)?;
+    let mut dst_planes = alloc_pixels(dst_plane * channels)?;
+    let mut pixels = alloc_pixels(dst_plane * 4)?;
+
+    // ACTUALLY_SAFE: `frame.pixels` holds src_w x src_h and `pixels` dst_w x dst_h BGRA pixels,
+    // which libyuv calls ARGB, the plane buffers hold `channels` planes of each size
+    let failed = unsafe {
+        let src = frame.pixels.as_mut_ptr();
+        let dst = pixels.as_mut_ptr();
+        let (src_base, dst_base) = (src_planes.as_mut_ptr(), dst_planes.as_mut_ptr());
+        let src_ptr = |c: usize| src_base.add(c * src_plane);
+        let dst_ptr = |c: usize| dst_base.add(c * dst_plane);
+
+        let (src_a, dst_a) = if has_alpha {
+            (src_ptr(3), dst_ptr(3))
+        } else {
+            (std::ptr::null_mut(), std::ptr::null_mut())
+        };
+
+        if has_alpha && sys::ARGBAttenuate(src, src_w * 4, src, src_w * 4, src_w, src_h) != 0 {
+            return Err(IG_STATUS_INTERNAL);
+        }
+
+        sys::SplitARGBPlane(
+            src,
+            src_w * 4,
+            src_ptr(0),
+            src_w,
+            src_ptr(1),
+            src_w,
+            src_ptr(2),
+            src_w,
+            src_a,
+            src_w,
+            src_w,
+            src_h,
+        );
+
+        let scale_failed = (0..channels).any(|c| {
+            sys::ScalePlane(
+                src_ptr(c),
+                src_w,
+                src_w,
+                src_h,
+                dst_ptr(c),
+                dst_w,
+                dst_w,
+                dst_h,
+                sys::FILTER_BOX,
+            ) != 0
+        });
+
+        if !scale_failed {
+            sys::MergeARGBPlane(
+                dst_ptr(0),
+                dst_w,
+                dst_ptr(1),
+                dst_w,
+                dst_ptr(2),
+                dst_w,
+                dst_a,
+                dst_w,
+                dst,
+                dst_w * 4,
+                dst_w,
+                dst_h,
+            );
+        }
+
+        scale_failed
+            || (has_alpha
+                && sys::ARGBUnattenuate(dst, dst_w * 4, dst, dst_w * 4, dst_w, dst_h) != 0)
+    };
+
+    if failed {
+        return Err(IG_STATUS_INTERNAL);
+    }
+
+    Ok(Frame {
+        pixels,
+        width,
+        height,
+    })
+}
+
 struct CacheEntry {
     path: String,
     stamp: (u64, u64),
@@ -669,6 +786,23 @@ pub fn decode(path: &str, index: u32, animating: bool) -> Result<Frame, i32> {
     }
 
     Ok(frame)
+}
+
+/// Decodes `index` frame of `path` shrunk to fit `max_width` x `max_height`, for thumbnails
+pub fn decode_scaled(
+    path: &str,
+    index: u32,
+    max_width: u32,
+    max_height: u32,
+) -> Result<Frame, i32> {
+    let file = acquire(path, false)?;
+
+    let (frame, has_alpha) = {
+        let mut file = lock(&file);
+        (file.decode_frame(index)?, file.metadata().has_alpha)
+    };
+
+    scale_to_fit(frame, has_alpha, max_width, max_height)
 }
 
 static LIVE_BUFFERS: LazyLock<Mutex<HashMap<usize, Vec<u8>>>> =

@@ -3,7 +3,10 @@ use std::ops::Range;
 const MAX_IPMA: usize = 4;
 const KNOWN_IPMA_BITS: u32 = 0x0100_0001;
 
-fn children(data: &[u8], range: Range<usize>) -> impl Iterator<Item = ([u8; 4], Range<usize>)> + '_ {
+fn children(
+    data: &[u8],
+    range: Range<usize>,
+) -> impl Iterator<Item = ([u8; 4], Range<usize>)> + '_ {
     let mut pos = range.start;
     std::iter::from_fn(move || {
         let header = data.get(pos..(pos + 8).min(range.end))?.get(..8)?;
@@ -39,7 +42,7 @@ pub fn split_duplicate_ipma(data: &mut [u8]) -> bool {
     let Some(meta) = find(data, 0..data.len(), b"meta") else {
         return false;
     };
-    
+
     if meta.len() < 4 {
         return false;
     }
@@ -62,7 +65,7 @@ pub fn split_duplicate_ipma(data: &mut [u8]) -> bool {
         .iter()
         .map(|&start| u32::from_be_bytes(data[start..start + 4].try_into().unwrap()))
         .collect();
-    
+
     if tags.iter().any(|&tag| tag & !KNOWN_IPMA_BITS != 0) {
         return false;
     }
@@ -71,7 +74,10 @@ pub fn split_duplicate_ipma(data: &mut [u8]) -> bool {
     let mut changed = false;
     for (start, mut tag) in ipma.into_iter().zip(tags) {
         if seen.contains(&tag) {
-            let Some(unique) = (1..24).map(|bit| tag | (1 << bit)).find(|t| !seen.contains(t)) else {
+            let Some(unique) = (1..24)
+                .map(|bit| tag | (1 << bit))
+                .find(|t| !seen.contains(t))
+            else {
                 return changed;
             };
             tag = unique;
