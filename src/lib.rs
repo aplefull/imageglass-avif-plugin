@@ -6,4 +6,5 @@ mod avif;
 mod bmff;
 mod host;
 mod plugin;
+mod prefetch;
 mod sys;

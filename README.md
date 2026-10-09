@@ -10,6 +10,17 @@ and [libyuv](https://chromium.googlesource.com/libyuv/libyuv).
    [Releases](https://github.com/aplefull/imageglass-avif-plugin/releases).
 2. ImageGlass → **Settings → Plugins → Add**, pick the zip, then **Trust and enable**.
 
+## How it works
+
+- ImageGlass asks the plugin for one frame at a time. Each frame is decoded with dav1d, converted
+  to 8-bit BGRA by libavif (using libyuv where it has a fast path), and rotated or mirrored as the
+  file specifies.
+- The 4 most recently used files stay open, so repeated requests skip reading and parsing.
+- During playback, the next frame is decoded in the background while the current one is on screen.
+- An animation whose decoded frames fit in 256 MB keeps them after the
+  first loop, so later loops don't decode at all. Larger animations are decoded fresh every loop
+  and use roughly constant memory.
+
 ## Build
 
 Needs Rust, git, CMake, meson, ninja and nasm (x86 only) on PATH. On Windows, also clang-cl and

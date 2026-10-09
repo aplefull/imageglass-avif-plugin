@@ -1,7 +1,7 @@
 {
   "id": "Plugin_AvifCodec",
   "name": "AVIF Codec",
-  "description": "Opens still and animated AVIF files with libavif and dav1d. Animations play frame by frame without loading every frame into memory.",
+  "description": "Opens still and animated AVIF files with libavif and dav1d.",
   "version": "1.0.0",
   "author": "aplefull",
   "website": "https://github.com/aplefull/imageglass-avif-plugin",

@@ -1,5 +1,5 @@
 use crate::abi::*;
-use crate::{avif, host};
+use crate::{avif, host, prefetch};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -154,7 +154,10 @@ unsafe extern "C" fn get_codec(index: i32, out: *mut *mut IGCodecApi) -> i32 {
 }
 
 unsafe extern "C" fn shutdown() {
-    let _ = catch_unwind(avif::clear_cache);
+    let _ = catch_unwind(|| {
+        prefetch::stop();
+        avif::clear_cache();
+    });
 }
 
 unsafe extern "C" fn get_capability(out: *mut *mut IGCodecCapability) -> i32 {
@@ -242,6 +245,7 @@ fn decode_into(
     name: &str,
     path: IGStringRef,
     frame_index: i32,
+    animating: bool,
     out: *mut IGPixelBuffer,
     cancel: *mut c_void,
 ) -> i32 {
@@ -257,11 +261,10 @@ fn decode_into(
         // ACTUALLY_SAFE: the host passes a valid path slice and output struct for the call
         let (path, out) = unsafe { (path.to_string_lossy(), &mut *out) };
 
-        into_status(avif::with_file(&path, |file| {
-            let frame = file.decode_frame(frame_index as u32)?;
-            avif::hand_over(frame, out);
-            Ok(())
-        }))
+        into_status(
+            avif::decode(&path, frame_index as u32, animating)
+                .map(|frame| avif::hand_over(frame, out)),
+        )
     })
 }
 
@@ -271,7 +274,7 @@ unsafe extern "C" fn decode_static_raster(
     out: *mut IGPixelBuffer,
     cancel: *mut c_void,
 ) -> i32 {
-    decode_into("DecodeStaticRaster", path, frame, out, cancel)
+    decode_into("DecodeStaticRaster", path, frame, false, out, cancel)
 }
 
 unsafe extern "C" fn decode_animation_frame(
@@ -280,7 +283,7 @@ unsafe extern "C" fn decode_animation_frame(
     out: *mut IGPixelBuffer,
     cancel: *mut c_void,
 ) -> i32 {
-    decode_into("DecodeAnimationFrame", path, frame, out, cancel)
+    decode_into("DecodeAnimationFrame", path, frame, true, out, cancel)
 }
 
 unsafe extern "C" fn free_pixel_buffer(buf: *mut IGPixelBuffer) {

@@ -2,14 +2,21 @@ use crate::abi::*;
 use crate::sys;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
 
 /// Open files kept around
 const MAX_CACHED_FILES: usize = 4;
 
+/// Memory all frame caches may hold together, an animation is cached only if all of it fits
+const FRAME_CACHE_BUDGET: usize = 256 << 20;
+
+/// Bytes currently reserved by frame caches
+static FRAME_CACHE_USED: AtomicUsize = AtomicUsize::new(0);
+
 /// Locks a mutex even if a panic poisoned it
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -44,10 +51,107 @@ pub struct Frame {
     pub height: u32,
 }
 
+struct FrameCache {
+    frame_bytes: usize,
+    frame_count: usize,
+    size: usize,
+    frames: Mutex<Option<Vec<Option<Arc<Frame>>>>>,
+}
+
+impl FrameCache {
+    fn new(frame_bytes: usize, frame_count: u32) -> Self {
+        let size = frame_bytes
+            .checked_mul(frame_count as usize)
+            .filter(|&size| frame_count > 1 && size <= FRAME_CACHE_BUDGET)
+            .unwrap_or(0);
+
+        Self {
+            frame_bytes,
+            frame_count: frame_count as usize,
+            size,
+            frames: Mutex::new(None),
+        }
+    }
+
+    fn wants_room(&self) -> bool {
+        self.size > 0 && lock(&self.frames).is_none()
+    }
+
+    fn is_reserved(&self) -> bool {
+        lock(&self.frames).is_some()
+    }
+
+    fn try_reserve(&self) -> bool {
+        let mut frames = lock(&self.frames);
+        if frames.is_some() {
+            return true;
+        }
+        if self.size == 0 {
+            return false;
+        }
+
+        let reserved = FRAME_CACHE_USED
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(self.size)
+                    .filter(|&total| total <= FRAME_CACHE_BUDGET)
+            })
+            .is_ok();
+
+        if reserved {
+            *frames = Some(vec![None; self.frame_count]);
+        }
+        reserved
+    }
+
+    fn release(&self) {
+        if lock(&self.frames).take().is_some() {
+            FRAME_CACHE_USED.fetch_sub(self.size, Ordering::AcqRel);
+        }
+    }
+
+    fn get(&self, index: u32) -> Option<Arc<Frame>> {
+        lock(&self.frames).as_ref()?.get(index as usize)?.clone()
+    }
+
+    fn contains(&self, index: u32) -> bool {
+        lock(&self.frames)
+            .as_ref()
+            .and_then(|frames| frames.get(index as usize))
+            .is_some_and(Option::is_some)
+    }
+
+    fn insert(&self, index: u32, frame: Frame) -> Option<Frame> {
+        if frame.pixels.len() != self.frame_bytes {
+            return Some(frame);
+        }
+
+        let mut frames = lock(&self.frames);
+        match frames
+            .as_mut()
+            .and_then(|frames| frames.get_mut(index as usize))
+        {
+            Some(slot) => {
+                *slot = Some(Arc::new(frame));
+                None
+            }
+            None => Some(frame),
+        }
+    }
+}
+
+impl Drop for FrameCache {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct AvifFile {
     decoder: *mut sys::avifDecoder,
     _data: Vec<u8>,
     has_frame: bool,
+    frames: Arc<FrameCache>,
+    next_wanted: Option<u32>,
+    prefetched: Option<(u32, Frame)>,
 }
 
 // ACTUALLY_SAFE: a libavif decoder has no thread affinity, the cache wraps every file in a
@@ -77,10 +181,13 @@ impl AvifFile {
                 return Err(IG_STATUS_OUT_OF_MEMORY);
             }
 
-            let file = Self {
+            let mut file = Self {
                 decoder,
                 _data: data,
                 has_frame: false,
+                frames: Arc::new(FrameCache::new(0, 0)),
+                next_wanted: None,
+                prefetched: None,
             };
 
             (*decoder).maxThreads = worker_threads() as i32;
@@ -103,8 +210,20 @@ impl AvifFile {
                 return Err(IG_STATUS_DECODE_FAILED);
             }
 
+            let image = &*(*decoder).image;
+            let frame_bytes = (image.width as usize)
+                .checked_mul(image.height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .unwrap_or(0);
+            file.frames = Arc::new(FrameCache::new(frame_bytes, file.frame_count()));
+
             Ok(file)
         }
+    }
+
+    fn frame_count(&self) -> u32 {
+        // ACTUALLY_SAFE: the decoder lives as long as `self`
+        unsafe { (*self.decoder).imageCount.max(1) as u32 }
     }
 
     /// Size of the displayed image, after the container's rotation is applied.
@@ -187,16 +306,83 @@ impl AvifFile {
         }
     }
 
-    /// Decodes `index` frame and converts it to BGRA
-    pub fn decode_frame(&mut self, index: u32) -> Result<Frame, i32> {
+    /// Returns `index` frame as BGRA, from the frame cache or the prefetched slot if they have it
+    fn decode_frame(&mut self, index: u32) -> Result<Frame, i32> {
+        if index >= self.frame_count() {
+            return Err(IG_STATUS_INVALID_ARG);
+        }
+
+        if let Some(cached) = self.frames.get(index) {
+            return copy_frame(&cached);
+        }
+
+        let frame = match self.prefetched.take() {
+            Some((prefetched, frame)) if prefetched == index => frame,
+            other => {
+                self.prefetched = other;
+                self.decode_uncached(index, true)?
+            }
+        };
+
+        if self.frames.is_reserved()
+            && let Ok(copy) = copy_frame(&frame)
+        {
+            self.frames.insert(index, copy);
+        }
+
+        Ok(frame)
+    }
+
+    /// Picks the frame to decode ahead after playback showed `shown`, if it is not ready yet
+    fn plan_prefetch(&mut self, shown: u32) -> Option<u32> {
+        let count = self.frame_count();
+        if count < 2 {
+            return None;
+        }
+
+        // thumbnails ask for frame 0 alone, it is playback only when the loop wraps around
+        if shown == 0 && self.next_wanted != Some(0) {
+            return None;
+        }
+
+        let next = (shown + 1) % count;
+        self.next_wanted = Some(next);
+
+        if self
+            .prefetched
+            .as_ref()
+            .is_some_and(|(index, _)| *index != next)
+        {
+            self.prefetched = None;
+        }
+
+        let ready = self.prefetched.is_some() || self.frames.contains(next);
+        (!ready).then_some(next)
+    }
+
+    /// Decodes `index` on the prefetch thread, unless playback has moved on or it is ready
+    fn decode_ahead(&mut self, index: u32) {
+        if self.next_wanted != Some(index)
+            || self.frames.contains(index)
+            || self.prefetched.as_ref().is_some_and(|(i, _)| *i == index)
+        {
+            return;
+        }
+
+        let Ok(frame) = self.decode_uncached(index, false) else {
+            return;
+        };
+
+        if let Some(frame) = self.frames.insert(index, frame) {
+            self.prefetched = Some((index, frame));
+        }
+    }
+
+    /// Decodes `index` frame with libavif and converts it to BGRA
+    fn decode_uncached(&mut self, index: u32, log_failure: bool) -> Result<Frame, i32> {
         // ACTUALLY_SAFE: decoder is valid and the Mutex around self makes access exclusive
         unsafe {
             let decoder = self.decoder;
-            let count = (*decoder).imageCount.max(1) as u32;
-            if index >= count {
-                return Err(IG_STATUS_INVALID_ARG);
-            }
-
             let current = (*decoder).imageIndex;
             let is_current = self.has_frame && current == index as i32;
 
@@ -209,22 +395,24 @@ impl AvifFile {
 
                 self.has_frame = result == sys::AVIF_RESULT_OK;
                 if !self.has_frame {
-                    crate::host::log(
-                        LOG_WARN,
-                        &format!("AVIF: frame {index} failed: {}", result_text(result)),
-                    );
+                    if log_failure {
+                        crate::host::log(
+                            LOG_WARN,
+                            &format!("AVIF: frame {index} failed: {}", result_text(result)),
+                        );
+                    }
                     return Err(IG_STATUS_DECODE_FAILED);
                 }
             }
 
-            let frame = to_bgra(&*(*decoder).image)?;
+            let frame = to_bgra(&*(*decoder).image, log_failure)?;
             apply_transforms(frame, &*(*decoder).image)
         }
     }
 }
 
 /// Converts the decoder's YUV image to straight-alpha BGRA8
-fn to_bgra(image: &sys::avifImage) -> Result<Frame, i32> {
+fn to_bgra(image: &sys::avifImage, log_failure: bool) -> Result<Frame, i32> {
     let width = image.width;
     let height = image.height;
     let row_bytes = width as usize * 4;
@@ -271,10 +459,12 @@ fn to_bgra(image: &sys::avifImage) -> Result<Frame, i32> {
 
         let result = sys::avifImageYUVToRGB(image, &mut rgb);
         if result != sys::AVIF_RESULT_OK {
-            crate::host::log(
-                LOG_WARN,
-                &format!("AVIF: YUV to RGB failed: {}", result_text(result)),
-            );
+            if log_failure {
+                crate::host::log(
+                    LOG_WARN,
+                    &format!("AVIF: YUV to RGB failed: {}", result_text(result)),
+                );
+            }
             return Err(IG_STATUS_DECODE_FAILED);
         }
     }
@@ -294,6 +484,21 @@ fn alloc_pixels(size: usize) -> Result<Vec<u8>, i32> {
         .map_err(|_| IG_STATUS_OUT_OF_MEMORY)?;
     pixels.resize(size, 0);
     Ok(pixels)
+}
+
+/// A copy of `frame`, or an error if memory runs out
+fn copy_frame(frame: &Frame) -> Result<Frame, i32> {
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(frame.pixels.len())
+        .map_err(|_| IG_STATUS_OUT_OF_MEMORY)?;
+    pixels.extend_from_slice(&frame.pixels);
+
+    Ok(Frame {
+        pixels,
+        width: frame.width,
+        height: frame.height,
+    })
 }
 
 /// Returns true if the image has a rotation transform
@@ -357,6 +562,7 @@ struct CacheEntry {
     path: String,
     stamp: (u64, u64),
     file: Arc<Mutex<AvifFile>>,
+    frames: Arc<FrameCache>,
 }
 
 static CACHE: LazyLock<Mutex<Vec<CacheEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -373,31 +579,57 @@ fn file_stamp(path: &str) -> Result<(u64, u64), i32> {
 }
 
 /// Returns the open file for `path`, parsing it on a miss
-pub fn acquire(path: &str) -> Result<Arc<Mutex<AvifFile>>, i32> {
+fn acquire(path: &str, playing: bool) -> Result<Arc<Mutex<AvifFile>>, i32> {
     let stamp = file_stamp(path)?;
     let mut cache = lock(&CACHE);
 
-    if let Some(pos) = cache.iter().position(|e| e.path == path) {
-        let entry = cache.remove(pos);
-        if entry.stamp == stamp {
-            let file = entry.file.clone();
-            cache.insert(0, entry);
-            return Ok(file);
-        }
-    }
+    let reused = cache
+        .iter()
+        .position(|e| e.path == path)
+        .map(|pos| cache.remove(pos))
+        .filter(|entry| entry.stamp == stamp);
 
-    let file = Arc::new(Mutex::new(AvifFile::open(path)?));
-    cache.insert(
-        0,
-        CacheEntry {
-            path: path.to_owned(),
-            stamp,
-            file: file.clone(),
-        },
-    );
+    let entry = match reused {
+        Some(entry) => entry,
+        None => {
+            let file = AvifFile::open(path)?;
+            CacheEntry {
+                path: path.to_owned(),
+                stamp,
+                frames: file.frames.clone(),
+                file: Arc::new(Mutex::new(file)),
+            }
+        }
+    };
+
+    let file = entry.file.clone();
+    cache.insert(0, entry);
     cache.truncate(MAX_CACHED_FILES);
 
+    if playing {
+        make_room(&cache);
+    }
+
     Ok(file)
+}
+
+/// Reserves the frame cache of the first entry, releasing the others' from the oldest on
+fn make_room(cache: &[CacheEntry]) {
+    let Some((current, others)) = cache.split_first() else {
+        return;
+    };
+
+    if !current.frames.wants_room() {
+        return;
+    }
+
+    for other in others.iter().rev() {
+        if current.frames.try_reserve() {
+            return;
+        }
+        other.frames.release();
+    }
+    current.frames.try_reserve();
 }
 
 /// Drops every open file
@@ -407,9 +639,36 @@ pub fn clear_cache() {
 
 /// Runs `f` on the locked file for `path`
 pub fn with_file<T>(path: &str, f: impl FnOnce(&mut AvifFile) -> Result<T, i32>) -> Result<T, i32> {
-    let file = acquire(path)?;
+    let file = acquire(path, false)?;
     let mut file = lock(&file);
     f(&mut file)
+}
+
+/// Decodes `index` frame of `path`
+pub fn decode(path: &str, index: u32, animating: bool) -> Result<Frame, i32> {
+    let file = acquire(path, animating && index > 0)?;
+
+    let (frame, next) = {
+        let mut guard = lock(&file);
+        let frame = guard.decode_frame(index)?;
+        let next = if animating {
+            guard.plan_prefetch(index)
+        } else {
+            None
+        };
+        (frame, next)
+    };
+
+    if let Some(next) = next {
+        let file = Arc::downgrade(&file);
+        crate::prefetch::request(move || {
+            if let Some(file) = file.upgrade() {
+                lock(&file).decode_ahead(next);
+            }
+        });
+    }
+
+    Ok(frame)
 }
 
 static LIVE_BUFFERS: LazyLock<Mutex<HashMap<usize, Vec<u8>>>> =
