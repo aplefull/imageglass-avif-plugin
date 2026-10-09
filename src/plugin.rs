@@ -225,9 +225,9 @@ unsafe extern "C" fn load_metadata(
             *out = IGImageInfo {
                 width: meta.width as i32,
                 height: meta.height as i32,
-                pixel_format: IG_PIXEL_FORMAT_BGRA8_UNORM,
+                pixel_format: meta.pixel_format,
                 has_alpha: meta.has_alpha as i32,
-                hdr_transfer_fn: IG_HDR_TRANSFER_FN_NONE,
+                hdr_transfer_fn: meta.hdr_transfer_fn,
                 color_space: meta.color_space,
                 // rotation and mirroring are already applied
                 orientation: 1,

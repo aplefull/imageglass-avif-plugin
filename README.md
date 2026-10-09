@@ -13,8 +13,11 @@ and [libyuv](https://chromium.googlesource.com/libyuv/libyuv).
 ## How it works
 
 - ImageGlass asks the plugin for one frame at a time. Each frame is decoded with dav1d, converted
-  to 8-bit BGRA by libavif (using libyuv where it has a fast path), and rotated or mirrored as the
-  file specifies.
+  to RGB by libavif (using libyuv where it has a fast path), and rotated or mirrored as the file
+  specifies.
+- 10- and 12-bit stills are passed on with 16 bits per channel. Animations and thumbnails use
+  8 bits.
+- HDR files keep their encoding and are tone-mapped by ImageGlass.
 - The 4 most recently used files stay open, so repeated requests skip reading and parsing.
 - During playback, the next frame is decoded in the background while the current one is on screen.
 - An animation whose decoded frames fit in 256 MB keeps them after the

@@ -14,14 +14,20 @@ pub const IG_STATUS_IO_ERROR: i32 = 8;
 
 // IGPixelFormat
 pub const IG_PIXEL_FORMAT_BGRA8_UNORM: i32 = 1;
+pub const IG_PIXEL_FORMAT_RGBA16_UNORM: i32 = 3;
 
 // IGColorSpace
 pub const IG_COLOR_SPACE_SRGB: i32 = 1;
+pub const IG_COLOR_SPACE_LINEAR_SRGB: i32 = 2;
 pub const IG_COLOR_SPACE_DISPLAY_P3: i32 = 3;
 pub const IG_COLOR_SPACE_REC2020: i32 = 5;
+pub const IG_COLOR_SPACE_REC2020_LINEAR: i32 = 6;
 
 // IGHdrTransferFn
 pub const IG_HDR_TRANSFER_FN_NONE: i32 = 0;
+pub const IG_HDR_TRANSFER_FN_PQ: i32 = 1;
+pub const IG_HDR_TRANSFER_FN_HLG: i32 = 2;
+pub const IG_HDR_TRANSFER_FN_GAIN_MAP: i32 = 3;
 
 // log levels for IGHostCoreApi.Log
 pub const LOG_WARN: i32 = 3;
@@ -38,7 +44,7 @@ impl IGStringRef {
     /// Copies the slice into a Rust string, replacing invalid UTF-16.
     ///
     /// `data` must point at `length` readable code units, or be null.
-    pub unsafe fn to_string_lossy(&self) -> String {
+    pub unsafe fn to_string_lossy(self) -> String {
         if self.data.is_null() || self.length <= 0 {
             return String::new();
         }

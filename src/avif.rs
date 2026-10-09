@@ -43,12 +43,37 @@ pub struct ImageMetadata {
     pub frame_count: u32,
     pub file_size: u64,
     pub color_space: i32,
+    pub hdr_transfer_fn: i32,
+    pub pixel_format: i32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    Bgra8,
+    Rgba16,
+}
+
+impl PixelFormat {
+    pub fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Bgra8 => 4,
+            Self::Rgba16 => 8,
+        }
+    }
+
+    pub fn ig_format(self) -> i32 {
+        match self {
+            Self::Bgra8 => IG_PIXEL_FORMAT_BGRA8_UNORM,
+            Self::Rgba16 => IG_PIXEL_FORMAT_RGBA16_UNORM,
+        }
+    }
 }
 
 pub struct Frame {
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    pub format: PixelFormat,
 }
 
 struct FrameCache {
@@ -242,6 +267,23 @@ impl AvifFile {
         }
     }
 
+    /// Format of full size still images: 16 bits when the file has more than 8 and the
+    /// buffer stays under the host's 2 GiB limit
+    fn still_format(&self) -> PixelFormat {
+        // ACTUALLY_SAFE: decoder.image is valid after a successful parse
+        let image = unsafe { &*(*self.decoder).image };
+        let fits = (image.width as usize)
+            .checked_mul(image.height as usize)
+            .and_then(|pixels| pixels.checked_mul(PixelFormat::Rgba16.bytes_per_pixel()))
+            .is_some_and(|size| size <= i32::MAX as usize);
+
+        if image.depth > 8 && fits {
+            PixelFormat::Rgba16
+        } else {
+            PixelFormat::Bgra8
+        }
+    }
+
     /// Returns metadata about the image, duh
     pub fn metadata(&self) -> ImageMetadata {
         let (width, height) = self.oriented_size();
@@ -250,6 +292,8 @@ impl AvifFile {
         unsafe {
             let decoder = &*self.decoder;
             let image = &*decoder.image;
+            let transfer = image.transferCharacteristics as i32;
+            let linear = transfer == sys::AVIF_TRANSFER_CHARACTERISTICS_LINEAR;
 
             ImageMetadata {
                 width,
@@ -258,10 +302,23 @@ impl AvifFile {
                 frame_count: decoder.imageCount.max(1) as u32,
                 file_size: self._data.len() as u64,
                 color_space: match image.colorPrimaries as i32 {
+                    sys::AVIF_COLOR_PRIMARIES_BT2020 if linear => IG_COLOR_SPACE_REC2020_LINEAR,
                     sys::AVIF_COLOR_PRIMARIES_BT2020 => IG_COLOR_SPACE_REC2020,
                     sys::AVIF_COLOR_PRIMARIES_SMPTE432 => IG_COLOR_SPACE_DISPLAY_P3,
+                    sys::AVIF_COLOR_PRIMARIES_BT709 | sys::AVIF_COLOR_PRIMARIES_UNSPECIFIED
+                        if linear =>
+                    {
+                        IG_COLOR_SPACE_LINEAR_SRGB
+                    }
                     _ => IG_COLOR_SPACE_SRGB,
                 },
+                hdr_transfer_fn: match transfer {
+                    sys::AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084 => IG_HDR_TRANSFER_FN_PQ,
+                    sys::AVIF_TRANSFER_CHARACTERISTICS_HLG => IG_HDR_TRANSFER_FN_HLG,
+                    _ if !image.gainMap.is_null() => IG_HDR_TRANSFER_FN_GAIN_MAP,
+                    _ => IG_HDR_TRANSFER_FN_NONE,
+                },
+                pixel_format: self.still_format().ig_format(),
             }
         }
     }
@@ -309,10 +366,14 @@ impl AvifFile {
         }
     }
 
-    /// Returns `index` frame as BGRA, from the frame cache or the prefetched slot if they have it
-    fn decode_frame(&mut self, index: u32) -> Result<Frame, i32> {
+    /// Returns `index` frame as BGRA8 from the frame cache or the prefetched slot if they have it
+    fn decode_frame(&mut self, index: u32, format: PixelFormat) -> Result<Frame, i32> {
         if index >= self.frame_count() {
             return Err(IG_STATUS_INVALID_ARG);
+        }
+
+        if format != PixelFormat::Bgra8 {
+            return self.decode_uncached(index, format, true);
         }
 
         if let Some(cached) = self.frames.get(index) {
@@ -323,7 +384,7 @@ impl AvifFile {
             Some((prefetched, frame)) if prefetched == index => frame,
             other => {
                 self.prefetched = other;
-                self.decode_uncached(index, true)?
+                self.decode_uncached(index, format, true)?
             }
         };
 
@@ -372,7 +433,7 @@ impl AvifFile {
             return;
         }
 
-        let Ok(frame) = self.decode_uncached(index, false) else {
+        let Ok(frame) = self.decode_uncached(index, PixelFormat::Bgra8, false) else {
             return;
         };
 
@@ -381,8 +442,13 @@ impl AvifFile {
         }
     }
 
-    /// Decodes `index` frame with libavif and converts it to BGRA
-    fn decode_uncached(&mut self, index: u32, log_failure: bool) -> Result<Frame, i32> {
+    /// Decodes `index` frame with libavif and converts it to `format`
+    fn decode_uncached(
+        &mut self,
+        index: u32,
+        format: PixelFormat,
+        log_failure: bool,
+    ) -> Result<Frame, i32> {
         // ACTUALLY_SAFE: decoder is valid and the Mutex around self makes access exclusive
         unsafe {
             let decoder = self.decoder;
@@ -408,17 +474,17 @@ impl AvifFile {
                 }
             }
 
-            let frame = to_bgra(&*(*decoder).image, log_failure)?;
+            let frame = to_rgb(&*(*decoder).image, format, log_failure)?;
             apply_transforms(frame, &*(*decoder).image)
         }
     }
 }
 
-/// Converts the decoder's YUV image to straight-alpha BGRA8
-fn to_bgra(image: &sys::avifImage, log_failure: bool) -> Result<Frame, i32> {
+/// Converts the decoder's YUV image to straight-alpha `format`
+fn to_rgb(image: &sys::avifImage, format: PixelFormat, log_failure: bool) -> Result<Frame, i32> {
     let width = image.width;
     let height = image.height;
-    let row_bytes = width as usize * 4;
+    let row_bytes = width as usize * format.bytes_per_pixel();
     let size = row_bytes
         .checked_mul(height as usize)
         .ok_or(IG_STATUS_OUT_OF_MEMORY)?;
@@ -428,6 +494,10 @@ fn to_bgra(image: &sys::avifImage, log_failure: bool) -> Result<Frame, i32> {
     }
 
     let mut pixels = alloc_pixels(size)?;
+
+    if pixels.as_ptr().align_offset(2) != 0 {
+        return Err(IG_STATUS_INTERNAL);
+    }
 
     // AD-HOC: libavif refuses the constant luminance matrices, their non-constant twins are close enough to substitute
     let substitute = match image.matrixCoefficients as i32 {
@@ -449,12 +519,14 @@ fn to_bgra(image: &sys::avifImage, log_failure: bool) -> Result<Frame, i32> {
         None => image,
     };
 
-    // ACTUALLY_SAFE: rgb points at `pixels`, sized for width x height x 4
+    // ACTUALLY_SAFE: rgb points at `pixels`, sized for width x height pixels of `format`
     unsafe {
         let mut rgb: sys::avifRGBImage = std::mem::zeroed();
         sys::avifRGBImageSetDefaults(&mut rgb, image);
-        rgb.format = sys::AVIF_RGB_FORMAT_BGRA;
-        rgb.depth = 8;
+        (rgb.format, rgb.depth) = match format {
+            PixelFormat::Bgra8 => (sys::AVIF_RGB_FORMAT_BGRA, 8),
+            PixelFormat::Rgba16 => (sys::AVIF_RGB_FORMAT_RGBA, 16),
+        };
         rgb.alphaPremultiplied = sys::AVIF_FALSE as _;
         rgb.maxThreads = worker_threads() as i32;
         rgb.pixels = pixels.as_mut_ptr();
@@ -476,6 +548,7 @@ fn to_bgra(image: &sys::avifImage, log_failure: bool) -> Result<Frame, i32> {
         pixels,
         width,
         height,
+        format,
     })
 }
 
@@ -501,12 +574,14 @@ fn copy_frame(frame: &Frame) -> Result<Frame, i32> {
         pixels,
         width: frame.width,
         height: frame.height,
+        format: frame.format,
     })
 }
 
 /// Returns true if the image has a rotation transform
 fn has_rotation(image: &sys::avifImage) -> bool {
-    image.transformFlags & sys::AVIF_TRANSFORM_IROT as u32 != 0 && image.irot.angle % 4 != 0
+    image.transformFlags & sys::AVIF_TRANSFORM_IROT as u32 != 0
+        && !image.irot.angle.is_multiple_of(4)
 }
 
 /// Returns true if the image has a mirror transform
@@ -537,28 +612,64 @@ fn apply_transforms(frame: Frame, image: &sys::avifImage) -> Result<Frame, i32> 
     let (dst_w, dst_h) = if cw % 2 == 1 { (h, w) } else { (w, h) };
     let mut pixels = alloc_pixels(frame.pixels.len())?;
 
-    // ACTUALLY_SAFE: both buffers hold w x h BGRA pixels
-    let result = unsafe {
-        sys::ARGBRotate(
-            frame.pixels.as_ptr(),
-            w as i32 * 4,
-            pixels.as_mut_ptr(),
-            dst_w as i32 * 4,
-            w as i32,
-            if flip { -(h as i32) } else { h as i32 },
-            cw as i32 * 90,
-        )
-    };
+    match frame.format {
+        PixelFormat::Bgra8 => {
+            // ACTUALLY_SAFE: both buffers hold w x h BGRA pixels
+            let result = unsafe {
+                sys::ARGBRotate(
+                    frame.pixels.as_ptr(),
+                    w as i32 * 4,
+                    pixels.as_mut_ptr(),
+                    dst_w as i32 * 4,
+                    w as i32,
+                    if flip { -(h as i32) } else { h as i32 },
+                    cw as i32 * 90,
+                )
+            };
 
-    if result != 0 {
-        return Err(IG_STATUS_INTERNAL);
+            if result != 0 {
+                return Err(IG_STATUS_INTERNAL);
+            }
+        }
+        // libyuv has no rotation for 64-bit pixels
+        PixelFormat::Rgba16 => rotate_pixels::<8>(&frame.pixels, &mut pixels, w, h, flip, cw),
     }
 
     Ok(Frame {
         pixels,
         width: dst_w,
         height: dst_h,
+        format: frame.format,
     })
+}
+
+/// What `ARGBRotate` does, for `N` byte pixels: flips `src` upside down if `flip`, then
+/// rotates it clockwise by `cw` quarter turns into `dst`
+fn rotate_pixels<const N: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    width: u32,
+    height: u32,
+    flip: bool,
+    cw: u8,
+) {
+    let (w, h) = (width as usize, height as usize);
+    let dst_w = if cw % 2 == 1 { h } else { w };
+    let (src, _) = src.as_chunks::<N>();
+    let (dst, _) = dst.as_chunks_mut::<N>();
+
+    for (y, row) in dst.chunks_exact_mut(dst_w).enumerate() {
+        for (x, pixel) in row.iter_mut().enumerate() {
+            let (src_x, src_y) = match cw % 4 {
+                1 => (y, h - 1 - x),
+                2 => (w - 1 - x, h - 1 - y),
+                3 => (w - 1 - y, x),
+                _ => (x, y),
+            };
+            let src_y = if flip { h - 1 - src_y } else { src_y };
+            *pixel = src[src_y * w + src_x];
+        }
+    }
 }
 
 /// The largest size inside `max_width` x `max_height` with the aspect ratio of `width` x `height`
@@ -582,6 +693,10 @@ fn scale_to_fit(
     let (width, height) = fit_box(frame.width, frame.height, max_width, max_height);
     if (width, height) == (frame.width, frame.height) {
         return Ok(frame);
+    }
+
+    if frame.format != PixelFormat::Bgra8 {
+        return Err(IG_STATUS_INTERNAL);
     }
 
     let (src_w, src_h) = (frame.width as i32, frame.height as i32);
@@ -672,6 +787,7 @@ fn scale_to_fit(
         pixels,
         width,
         height,
+        format: PixelFormat::Bgra8,
     })
 }
 
@@ -767,7 +883,12 @@ pub fn decode(path: &str, index: u32, animating: bool) -> Result<Frame, i32> {
 
     let (frame, next) = {
         let mut guard = lock(&file);
-        let frame = guard.decode_frame(index)?;
+        let format = if animating {
+            PixelFormat::Bgra8
+        } else {
+            guard.still_format()
+        };
+        let frame = guard.decode_frame(index, format)?;
         let next = if animating {
             guard.plan_prefetch(index)
         } else {
@@ -799,7 +920,8 @@ pub fn decode_scaled(
 
     let (frame, has_alpha) = {
         let mut file = lock(&file);
-        (file.decode_frame(index)?, file.metadata().has_alpha)
+        let frame = file.decode_frame(index, PixelFormat::Bgra8)?;
+        (frame, file.metadata().has_alpha)
     };
 
     scale_to_fit(frame, has_alpha, max_width, max_height)
@@ -816,8 +938,8 @@ pub fn hand_over(frame: Frame, out: &mut IGPixelBuffer) {
     out.data = data;
     out.width = frame.width as i32;
     out.height = frame.height as i32;
-    out.stride = frame.width as i32 * 4;
-    out.pixel_format = IG_PIXEL_FORMAT_BGRA8_UNORM;
+    out.stride = (frame.width as usize * frame.format.bytes_per_pixel()) as i32;
+    out.pixel_format = frame.format.ig_format();
     out.release_context = data.cast();
 
     lock(&LIVE_BUFFERS).insert(data as usize, pixels);
