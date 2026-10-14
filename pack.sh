@@ -17,9 +17,10 @@ case "$(uname -s)" in
     Darwin) os=mac;   lib=libAvifCodec.dylib; data="$HOME/Library/Application Support" ;;
     *)      os=win;   lib=AvifCodec.dll;      data=$(cygpath -u "$LOCALAPPDATA") ;;
 esac
-case "$(uname -m)" in
-    arm64 | aarch64) arch=arm64 ;;
-    *)               arch=x64 ;;
+case "$(rustc -vV | sed -n 's/^host: //p')" in
+    aarch64-*) arch=arm64 ;;
+    x86_64-*)  arch=x64 ;;
+    *)         echo "unsupported architecture" >&2; exit 1 ;;
 esac
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 zip="avif-codec_${version}_$os-$arch.igplugin.zip"

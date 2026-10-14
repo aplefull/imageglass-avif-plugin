@@ -2,7 +2,7 @@
   "id": "Plugin_AvifCodec",
   "name": "AVIF Codec",
   "description": "Opens still and animated AVIF files with libavif and dav1d.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "aplefull",
   "website": "https://github.com/aplefull/imageglass-avif-plugin",
   "kind": "Codec",

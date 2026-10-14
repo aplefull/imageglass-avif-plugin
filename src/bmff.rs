@@ -226,9 +226,9 @@ pub fn hide_gain_map(data: &mut [u8]) -> bool {
     }
 
     let mut changed = false;
-    for brand in data[ftyp.start + 8..ftyp.end].chunks_exact_mut(4) {
+    for brand in data[ftyp.start + 8..ftyp.end].as_chunks_mut::<4>().0 {
         if brand == b"tmap" {
-            brand.copy_from_slice(&major);
+            *brand = major;
             changed = true;
         }
     }

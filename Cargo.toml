@@ -1,6 +1,6 @@
 [package]
 name = "avif-imageglass-plugin"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "AVIF codec plugin for ImageGlass, powered by libavif, dav1d and libyuv"
 publish = false

@@ -116,7 +116,7 @@ impl FrameCache {
         }
 
         let reserved = FRAME_CACHE_USED
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(self.size)
                     .filter(|&total| total <= FRAME_CACHE_BUDGET)
             })
@@ -514,7 +514,7 @@ impl AvifFile {
                     if sys::avifDecoderReset(decoder) != sys::AVIF_RESULT_OK {
                         self.broken = true;
                     }
-                    
+
                     return Err(IG_STATUS_DECODE_FAILED);
                 }
             }

@@ -117,6 +117,11 @@ fn main() {
         .arg("-DAVIF_BUILD_TESTS=OFF")
         .arg("-DAVIF_ENABLE_WERROR=OFF");
 
+    if msvc && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        let flags = "-DLIBYUV_DISABLE_NEON -DLIBYUV_DISABLE_SVE";
+        configure.env("CFLAGS", flags).env("CXXFLAGS", flags);
+    }
+
     if msvc {
         configure.arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL");
     }
