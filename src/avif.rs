@@ -174,6 +174,7 @@ pub struct AvifFile {
     decoder: *mut sys::avifDecoder,
     _data: Vec<u8>,
     has_frame: bool,
+    broken: bool,
     frames: Arc<FrameCache>,
     next_wanted: Option<u32>,
     prefetched: Option<(u32, Frame)>,
@@ -193,26 +194,67 @@ impl Drop for AvifFile {
 impl AvifFile {
     fn open(path: &str) -> Result<Self, i32> {
         let mut data = std::fs::read(path).map_err(|_| IG_STATUS_IO_ERROR)?;
-
-        // AD-HOC: repair duplicate ipma boxes
-        if crate::bmff::split_duplicate_ipma(&mut data) {
+        let repaired = |what: &str| {
             crate::host::log(
                 LOG_WARN,
-                &format!("AVIF: '{path}' has duplicate ipma boxes, repaired in memory"),
+                &format!("AVIF: '{path}' {what}, repaired in memory"),
             );
+        };
+
+        // AD-HOC: these only touch structures libavif always rejects, valid files are unaffected
+        if crate::bmff::split_duplicate_ipma(&mut data) {
+            repaired("has duplicate ipma boxes");
+        }
+        if crate::bmff::mark_transforms_essential(&mut data) {
+            repaired("has crop, rotation or mirroring not marked essential");
+        }
+        if crate::bmff::fix_aux_reference_to_item_zero(&mut data) {
+            repaired("has an auxiliary image referencing item 0");
         }
 
+        let mut result = Self::parse(data);
+
+        // AD-HOC: invalid gain map metadata fails the whole file, without the 'tmap' brand libavif
+        // ignores the gain map and decodes the base image
+        if let Err((data, sys::AVIF_RESULT_INVALID_TONE_MAPPED_IMAGE)) = &mut result
+            && crate::bmff::hide_gain_map(data)
+        {
+            crate::host::log(
+                LOG_WARN,
+                &format!("AVIF: '{path}' has invalid gain map metadata, showing the base image"),
+            );
+            if let Err((data, _)) = result {
+                result = Self::parse(data);
+            }
+        }
+
+        result.map_err(|(_, result)| {
+            crate::host::log(
+                LOG_WARN,
+                &format!("AVIF: cannot parse '{path}': {}", result_text(result)),
+            );
+            if result == sys::AVIF_RESULT_OUT_OF_MEMORY {
+                IG_STATUS_OUT_OF_MEMORY
+            } else {
+                IG_STATUS_DECODE_FAILED
+            }
+        })
+    }
+
+    /// Parses the file in `data`, handing `data` back with libavif's error on failure
+    fn parse(data: Vec<u8>) -> Result<Self, (Vec<u8>, sys::avifResult)> {
         // ACTUALLY_SAFE: plain libavif calls, the decoder only reads `data`, which the struct keeps alive
         unsafe {
             let decoder = sys::avifDecoderCreate();
             if decoder.is_null() {
-                return Err(IG_STATUS_OUT_OF_MEMORY);
+                return Err((data, sys::AVIF_RESULT_OUT_OF_MEMORY));
             }
 
             let mut file = Self {
                 decoder,
                 _data: data,
                 has_frame: false,
+                broken: false,
                 frames: Arc::new(FrameCache::new(0, 0)),
                 next_wanted: None,
                 prefetched: None,
@@ -223,19 +265,13 @@ impl AvifFile {
             (*decoder).ignoreExif = sys::AVIF_TRUE as _;
             (*decoder).ignoreXMP = sys::AVIF_TRUE as _;
 
-            let result =
+            let mut result =
                 sys::avifDecoderSetIOMemory(decoder, file._data.as_ptr(), file._data.len());
-            if result != sys::AVIF_RESULT_OK {
-                return Err(IG_STATUS_INTERNAL);
+            if result == sys::AVIF_RESULT_OK {
+                result = sys::avifDecoderParse(decoder);
             }
-
-            let result = sys::avifDecoderParse(decoder);
             if result != sys::AVIF_RESULT_OK {
-                crate::host::log(
-                    LOG_WARN,
-                    &format!("AVIF: cannot parse '{path}': {}", result_text(result)),
-                );
-                return Err(IG_STATUS_DECODE_FAILED);
+                return Err((std::mem::take(&mut file._data), result));
             }
 
             let image = &*(*decoder).image;
@@ -449,6 +485,10 @@ impl AvifFile {
         format: PixelFormat,
         log_failure: bool,
     ) -> Result<Frame, i32> {
+        if self.broken {
+            return Err(IG_STATUS_DECODE_FAILED);
+        }
+
         // ACTUALLY_SAFE: decoder is valid and the Mutex around self makes access exclusive
         unsafe {
             let decoder = self.decoder;
@@ -470,6 +510,11 @@ impl AvifFile {
                             &format!("AVIF: frame {index} failed: {}", result_text(result)),
                         );
                     }
+
+                    if sys::avifDecoderReset(decoder) != sys::AVIF_RESULT_OK {
+                        self.broken = true;
+                    }
+                    
                     return Err(IG_STATUS_DECODE_FAILED);
                 }
             }
